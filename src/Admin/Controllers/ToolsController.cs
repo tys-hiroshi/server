@@ -1,13 +1,17 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text;
 using System.Threading.Tasks;
 using Bit.Admin.Models;
 using Bit.Core;
+using Bit.Core.Models.Table;
 using Bit.Core.Repositories;
+using Bit.Core.Services;
 using Bit.Core.Utilities;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Newtonsoft.Json;
 
 namespace Bit.Admin.Controllers
 {
@@ -16,17 +20,35 @@ namespace Bit.Admin.Controllers
     public class ToolsController : Controller
     {
         private readonly GlobalSettings _globalSettings;
+        private readonly IOrganizationRepository _organizationRepository;
+        private readonly IOrganizationService _organizationService;
+        private readonly IUserService _userService;
         private readonly ITransactionRepository _transactionRepository;
+        private readonly IInstallationRepository _installationRepository;
         private readonly IOrganizationUserRepository _organizationUserRepository;
+        private readonly IPaymentService _paymentService;
+        private readonly ITaxRateRepository _taxRateRepository;
 
         public ToolsController(
             GlobalSettings globalSettings,
+            IOrganizationRepository organizationRepository,
+            IOrganizationService organizationService,
+            IUserService userService,
             ITransactionRepository transactionRepository,
-            IOrganizationUserRepository organizationUserRepository)
+            IInstallationRepository installationRepository,
+            IOrganizationUserRepository organizationUserRepository,
+            ITaxRateRepository taxRateRepository,
+            IPaymentService paymentService)
         {
             _globalSettings = globalSettings;
+            _organizationRepository = organizationRepository;
+            _organizationService = organizationService;
+            _userService = userService;
             _transactionRepository = transactionRepository;
+            _installationRepository = installationRepository;
             _organizationUserRepository = organizationUserRepository;
+            _taxRateRepository = taxRateRepository;
+            _paymentService = paymentService;
         }
 
         public IActionResult ChargeBraintree()
@@ -144,7 +166,7 @@ namespace Bit.Admin.Controllers
 
         public IActionResult PromoteAdmin()
         {
-            return View("PromoteAdmin");
+            return View();
         }
 
         [HttpPost]
@@ -152,7 +174,7 @@ namespace Bit.Admin.Controllers
         {
             if (!ModelState.IsValid)
             {
-                return View("PromoteAdmin", model);
+                return View(model);
             }
 
             var orgUsers = await _organizationUserRepository.GetManyByOrganizationAsync(
@@ -169,12 +191,182 @@ namespace Bit.Admin.Controllers
 
             if (!ModelState.IsValid)
             {
-                return View("PromoteAdmin", model);
+                return View(model);
             }
 
             user.Type = Core.Enums.OrganizationUserType.Owner;
             await _organizationUserRepository.ReplaceAsync(user);
             return RedirectToAction("Edit", "Organizations", new { id = model.OrganizationId.Value });
+        }
+
+        public IActionResult GenerateLicense()
+        {
+            return View();
+        }
+
+        [HttpPost]
+        public async Task<IActionResult> GenerateLicense(LicenseModel model)
+        {
+            if (!ModelState.IsValid)
+            {
+                return View(model);
+            }
+
+            User user = null;
+            Organization organization = null;
+            if (model.UserId.HasValue)
+            {
+                user = await _userService.GetUserByIdAsync(model.UserId.Value);
+                if (user == null)
+                {
+                    ModelState.AddModelError(nameof(model.UserId), "User Id not found.");
+                }
+            }
+            else if (model.OrganizationId.HasValue)
+            {
+                organization = await _organizationRepository.GetByIdAsync(model.OrganizationId.Value);
+                if (organization == null)
+                {
+                    ModelState.AddModelError(nameof(model.OrganizationId), "Organization not found.");
+                }
+                else if (!organization.Enabled)
+                {
+                    ModelState.AddModelError(nameof(model.OrganizationId), "Organization is disabled.");
+                }
+            }
+            if (model.InstallationId.HasValue)
+            {
+                var installation = await _installationRepository.GetByIdAsync(model.InstallationId.Value);
+                if (installation == null)
+                {
+                    ModelState.AddModelError(nameof(model.InstallationId), "Installation not found.");
+                }
+                else if (!installation.Enabled)
+                {
+                    ModelState.AddModelError(nameof(model.OrganizationId), "Installation is disabled.");
+                }
+            }
+
+            if (!ModelState.IsValid)
+            {
+                return View(model);
+            }
+
+            if (organization != null)
+            {
+                var license = await _organizationService.GenerateLicenseAsync(organization,
+                    model.InstallationId.Value, model.Version);
+                return File(Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(license, Formatting.Indented)),
+                    "text/plain", "bitwarden_organization_license.json");
+            }
+            else if (user != null)
+            {
+                var license = await _userService.GenerateLicenseAsync(user, null, model.Version);
+                return File(Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(license, Formatting.Indented)),
+                    "text/plain", "bitwarden_premium_license.json");
+            }
+            else
+            {
+                throw new Exception("No license to generate.");
+            }
+        }
+
+        public async Task<IActionResult> TaxRate(int page = 1, int count = 25)
+        {
+            if (page < 1)
+            {
+                page = 1;
+            }
+
+            if (count < 1)
+            {
+                count = 1;
+            }
+            
+            var skip = (page - 1) * count;
+            var rates = await _taxRateRepository.SearchAsync(skip, count);
+            return View(new TaxRatesModel
+            {
+                Items = rates.ToList(),
+                Page = page,
+                Count = count
+            });
+        }
+
+        public async Task<IActionResult> TaxRateAddEdit(string stripeTaxRateId = null) 
+        {
+            if (string.IsNullOrWhiteSpace(stripeTaxRateId))
+            {
+                return View(new TaxRateAddEditModel());
+            }
+            
+            var rate = await _taxRateRepository.GetByIdAsync(stripeTaxRateId);
+            var model = new TaxRateAddEditModel()
+            {
+                StripeTaxRateId = stripeTaxRateId,
+                Country = rate.Country,
+                State = rate.State,
+                PostalCode = rate.PostalCode,
+                Rate = rate.Rate
+            };
+
+            return View(model);
+        }
+
+        [HttpPost]
+        public async Task<IActionResult> TaxRateAddEdit(TaxRateAddEditModel model) 
+        {
+            var existingRateCheck = await _taxRateRepository.GetByLocationAsync(new TaxRate() { Country = model.Country, PostalCode = model.PostalCode });
+            if (existingRateCheck.Any()) 
+            {
+               ModelState.AddModelError(nameof(model.PostalCode), "A tax rate already exists for this Country/Postal Code combination.");
+            }
+
+            if (!ModelState.IsValid)
+            {
+                return View(model);
+            }
+
+            var taxRate = new TaxRate()
+            {
+                Id = model.StripeTaxRateId,
+                Country = model.Country,
+                State = model.State,
+                PostalCode = model.PostalCode,
+                Rate = model.Rate
+            };
+
+            if (!string.IsNullOrWhiteSpace(model.StripeTaxRateId))
+            {
+                await _paymentService.UpdateTaxRateAsync(taxRate);
+            }
+            else
+            {
+                await _paymentService.CreateTaxRateAsync(taxRate);
+            }
+
+            return RedirectToAction("TaxRate");
+        }
+
+        [HttpPost]
+        public async Task<IActionResult> TaxRateUpdate(TaxRate model) 
+        {
+            if (!string.IsNullOrWhiteSpace(model.Id))
+            {
+                await _paymentService.UpdateTaxRateAsync(model);
+            }
+
+            return RedirectToAction("TaxRate");
+        }
+
+        public async Task<IActionResult> TaxRateArchive(string stripeTaxRateId) 
+        {
+            if (!string.IsNullOrWhiteSpace(stripeTaxRateId))
+            {
+                await _paymentService.ArchiveTaxRateAsync(new TaxRate() { Id = stripeTaxRateId });
+            }
+
+            return RedirectToAction("TaxRate");
         }
     }
 }

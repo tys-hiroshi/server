@@ -78,13 +78,13 @@ namespace Bit.Api
                 config.AddPolicy("Application", policy =>
                 {
                     policy.RequireAuthenticatedUser();
-                    policy.RequireClaim(JwtClaimTypes.AuthenticationMethod, "Application");
+                    policy.RequireClaim(JwtClaimTypes.AuthenticationMethod, "Application", "external");
                     policy.RequireClaim(JwtClaimTypes.Scope, "api");
                 });
                 config.AddPolicy("Web", policy =>
                 {
                     policy.RequireAuthenticatedUser();
-                    policy.RequireClaim(JwtClaimTypes.AuthenticationMethod, "Application");
+                    policy.RequireClaim(JwtClaimTypes.AuthenticationMethod, "Application", "external");
                     policy.RequireClaim(JwtClaimTypes.Scope, "api");
                     policy.RequireClaim(JwtClaimTypes.ClientId, "web");
                 });
@@ -110,6 +110,7 @@ namespace Bit.Api
             // Services
             services.AddBaseServices();
             services.AddDefaultServices(globalSettings);
+            services.AddCoreLocalizationServices();
 
             // MVC
             services.AddMvc(config =>
@@ -125,6 +126,8 @@ namespace Bit.Api
             });
 
             services.AddSwagger(globalSettings);
+            Jobs.JobsHostedService.AddJobsServices(services);
+            services.AddHostedService<Jobs.JobsHostedService>();
 
             if (globalSettings.SelfHosted)
             {
@@ -162,6 +165,9 @@ namespace Bit.Api
                 app.UseForwardedHeaders(globalSettings);
             }
 
+            // Add localization
+            app.UseCoreLocalization();
+
             // Add static files to the request pipeline.
             app.UseStaticFiles();
 
@@ -169,7 +175,7 @@ namespace Bit.Api
             app.UseRouting();
 
             // Add Cors
-            app.UseCors(policy => policy.SetIsOriginAllowed(h => true)
+            app.UseCors(policy => policy.SetIsOriginAllowed(o => CoreHelpers.IsCorsOriginAllowed(o, globalSettings))
                 .AllowAnyMethod().AllowAnyHeader().AllowCredentials());
 
             // Add authentication and authorization to the request pipeline.
@@ -188,12 +194,10 @@ namespace Bit.Api
                 app.UseSwagger(config =>
                 {
                     config.RouteTemplate = "specs/{documentName}/swagger.json";
-                    var host = globalSettings.BaseServiceUri.Api.Replace("https://", string.Empty)
-                        .Replace("http://", string.Empty);
                     config.PreSerializeFilters.Add((swaggerDoc, httpReq) =>
                         swaggerDoc.Servers = new List<OpenApiServer>
                         {
-                            new OpenApiServer { Url = $"{httpReq.Scheme}://{host}" }
+                            new OpenApiServer { Url = globalSettings.BaseServiceUri.Api }
                         });
                 });
                 app.UseSwaggerUI(config =>

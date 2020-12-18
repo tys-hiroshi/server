@@ -1,7 +1,7 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk.Web">
 
   <PropertyGroup>
-    <Version>1.33.1</Version>
+    <Version>1.38.4</Version>
     <TargetFramework>netcoreapp3.1</TargetFramework>
     <RootNamespace>Bit.Identity</RootNamespace>
     <UserSecretsId>bitwarden-Identity</UserSecretsId>
@@ -9,7 +9,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="NewRelic.Agent" Version="8.24.244" />
+    <PackageReference Include="NewRelic.Agent" Version="8.30.0" />
   </ItemGroup>
 
   <ItemGroup>

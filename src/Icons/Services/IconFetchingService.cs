@@ -36,16 +36,10 @@ namespace Bit.Icons.Services
         private readonly HashSet<string> _allowedMediaTypes;
         private readonly HttpClient _httpClient;
         private readonly ILogger<IIconFetchingService> _logger;
-        private readonly Regex _ipRegex;
 
         public IconFetchingService(ILogger<IIconFetchingService> logger)
         {
             _logger = logger;
-            _ipRegex = new Regex("^" +
-                "(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\." +
-                "(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\." +
-                "(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\." +
-                "(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$");
             _allowedMediaTypes = new HashSet<string>
             {
                 _pngMediaType,
@@ -64,7 +58,7 @@ namespace Bit.Icons.Services
 
         public async Task<IconResult> GetIconAsync(string domain)
         {
-            if (_ipRegex.IsMatch(domain))
+            if (IPAddress.TryParse(domain, out _))
             {
                 _logger.LogWarning("IP address: {0}.", domain);
                 return null;
@@ -280,6 +274,37 @@ namespace Bit.Icons.Services
 
         private async Task<HttpResponseMessage> GetAsync(Uri uri)
         {
+            if (uri == null)
+            {
+                return null;
+            }
+
+            // Prevent non-http(s) and non-default ports
+            if ((uri.Scheme != "http" && uri.Scheme != "https") || !uri.IsDefaultPort)
+            {
+                return null;
+            }
+
+            // Prevent local hosts (localhost, bobs-pc, etc) and IP addresses
+            if (!uri.Host.Contains(".") || IPAddress.TryParse(uri.Host, out _))
+            {
+                return null;
+            }
+
+            // Resolve host to make sure it is not an internal/private IP address
+            try
+            {
+                var hostEntry = Dns.GetHostEntry(uri.Host);
+                if (hostEntry?.AddressList.Any(ip => IsInternal(ip)) ?? true)
+                {
+                    return null;
+                }
+            }
+            catch
+            {
+                return null;
+            }
+
             using (var message = new HttpRequestMessage())
             {
                 message.RequestUri = uri;
@@ -393,6 +418,40 @@ namespace Bit.Icons.Services
         private string GetScheme(Uri uri)
         {
             return uri != null && uri.Scheme == "http" ? "http" : "https";
+        }
+
+        public static bool IsInternal(IPAddress ip)
+        {
+            if (IPAddress.IsLoopback(ip))
+            {
+                return true;
+            }
+
+            var ipString = ip.ToString();
+            if (ipString == "::1" || ipString == "::")
+            {
+                return true;
+            }
+
+            // IPv6
+            if (ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6)
+            {
+                return ipString.StartsWith("fc") || ipString.StartsWith("fd") ||
+                    ipString.StartsWith("fe") || ipString.StartsWith("ff");
+            }
+
+            // IPv4
+            var bytes = ip.GetAddressBytes();
+            return (bytes[0]) switch
+            {
+                0 => true,
+                10 => true,
+                127 => true,
+                169 => bytes[1] == 254, // Cloud environments, such as AWS
+                172 => bytes[1] < 32 && bytes[1] >= 16,
+                192 => bytes[1] == 168,
+                _ => false,
+            };
         }
     }
 }

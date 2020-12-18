@@ -5,9 +5,6 @@ using Bit.Core.Models.Table;
 using Bit.Core.Repositories;
 using Bit.Core.Services;
 using IdentityModel;
-using IdentityServer4.Services;
-using IdentityServer4.Stores;
-using IdentityServer4.Validation;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Hosting;
@@ -35,6 +32,9 @@ using AutoMapper;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Azure.Storage;
+using System.Reflection;
+using Bit.Core.Resources;
+using Microsoft.AspNetCore.Mvc.Localization;
 
 namespace Bit.Core.Utilities
 {
@@ -76,6 +76,11 @@ namespace Bit.Core.Utilities
                 services.AddSingleton<IMaintenanceRepository, SqlServerRepos.MaintenanceRepository>();
                 services.AddSingleton<ITransactionRepository, SqlServerRepos.TransactionRepository>();
                 services.AddSingleton<IPolicyRepository, SqlServerRepos.PolicyRepository>();
+                services.AddSingleton<ISsoConfigRepository, SqlServerRepos.SsoConfigRepository>();
+                services.AddSingleton<ISsoUserRepository, SqlServerRepos.SsoUserRepository>();
+                services.AddSingleton<ISendRepository, SqlServerRepos.SendRepository>();
+                services.AddSingleton<ITaxRateRepository, SqlServerRepos.TaxRateRepository>();
+                services.AddSingleton<IEmergencyAccessRepository, SqlServerRepos.EmergencyAccessRepository>();
             }
 
             if (globalSettings.SelfHosted)
@@ -108,8 +113,11 @@ namespace Bit.Core.Utilities
             services.AddScoped<IGroupService, GroupService>();
             services.AddScoped<IPolicyService, PolicyService>();
             services.AddScoped<Services.IEventService, EventService>();
+            services.AddScoped<IEmergencyAccessService, EmergencyAccessService>();
             services.AddSingleton<IDeviceService, DeviceService>();
             services.AddSingleton<IAppleIapService, AppleIapService>();
+            services.AddSingleton<ISsoConfigService, SsoConfigService>();
+            services.AddScoped<ISendService, SendService>();
         }
 
         public static void AddDefaultServices(this IServiceCollection services, GlobalSettings globalSettings)
@@ -195,6 +203,28 @@ namespace Bit.Core.Utilities
             else
             {
                 services.AddSingleton<IAttachmentStorageService, NoopAttachmentStorageService>();
+            }
+
+            if (CoreHelpers.SettingHasValue(globalSettings.Send.ConnectionString))
+            {
+                services.AddSingleton<ISendFileStorageService, AzureSendFileStorageService>();
+            }
+            else if (CoreHelpers.SettingHasValue(globalSettings.Send.BaseDirectory))
+            {
+                services.AddSingleton<ISendFileStorageService, LocalSendStorageService>();
+            }
+            else
+            {
+                services.AddSingleton<ISendFileStorageService, NoopSendFileStorageService>();
+            }
+
+            if (globalSettings.SelfHosted)
+            {
+                services.AddSingleton<IReferenceEventService, NoopReferenceEventService>();
+            }
+            else
+            {
+                services.AddSingleton<IReferenceEventService, AzureQueueReferenceEventService>();
             }
         }
 
@@ -329,70 +359,10 @@ namespace Bit.Core.Utilities
             }
         }
 
-        public static IIdentityServerBuilder AddCustomIdentityServerServices(
-            this IServiceCollection services, IWebHostEnvironment env, GlobalSettings globalSettings)
-        {
-            var issuerUri = new Uri(globalSettings.BaseServiceUri.InternalIdentity);
-            var identityServerBuilder = services
-                .AddIdentityServer(options =>
-                {
-                    options.Endpoints.EnableAuthorizeEndpoint = false;
-                    options.Endpoints.EnableIntrospectionEndpoint = false;
-                    options.Endpoints.EnableEndSessionEndpoint = false;
-                    options.Endpoints.EnableUserInfoEndpoint = false;
-                    options.Endpoints.EnableCheckSessionEndpoint = false;
-                    options.Endpoints.EnableTokenRevocationEndpoint = false;
-                    options.IssuerUri = $"{issuerUri.Scheme}://{issuerUri.Host}";
-                    options.Caching.ClientStoreExpiration = new TimeSpan(0, 5, 0);
-                })
-                .AddInMemoryCaching()
-                .AddInMemoryApiResources(ApiResources.GetApiResources())
-                .AddClientStoreCache<ClientStore>();
-
-            if (env.IsDevelopment())
-            {
-                identityServerBuilder.AddDeveloperSigningCredential(false);
-            }
-            else if (globalSettings.SelfHosted &&
-                CoreHelpers.SettingHasValue(globalSettings.IdentityServer.CertificatePassword)
-                && File.Exists("identity.pfx"))
-            {
-                var identityServerCert = CoreHelpers.GetCertificate("identity.pfx",
-                    globalSettings.IdentityServer.CertificatePassword);
-                identityServerBuilder.AddSigningCredential(identityServerCert);
-            }
-            else if (CoreHelpers.SettingHasValue(globalSettings.IdentityServer.CertificateThumbprint))
-            {
-                var identityServerCert = CoreHelpers.GetCertificate(
-                    globalSettings.IdentityServer.CertificateThumbprint);
-                identityServerBuilder.AddSigningCredential(identityServerCert);
-            }
-            else if (!globalSettings.SelfHosted &&
-                CoreHelpers.SettingHasValue(globalSettings.Storage?.ConnectionString) &&
-                CoreHelpers.SettingHasValue(globalSettings.IdentityServer.CertificatePassword))
-            {
-                var storageAccount = CloudStorageAccount.Parse(globalSettings.Storage.ConnectionString);
-                var identityServerCert = CoreHelpers.GetBlobCertificateAsync(storageAccount, "certificates",
-                    "identity.pfx", globalSettings.IdentityServer.CertificatePassword).GetAwaiter().GetResult();
-                identityServerBuilder.AddSigningCredential(identityServerCert);
-            }
-            else
-            {
-                throw new Exception("No identity certificate to use.");
-            }
-
-            services.AddTransient<ClientStore>();
-            services.AddTransient<ICorsPolicyService, AllowAllCorsPolicyService>();
-            services.AddScoped<IResourceOwnerPasswordValidator, ResourceOwnerPasswordValidator>();
-            services.AddScoped<IProfileService, ProfileService>();
-            services.AddSingleton<IPersistedGrantStore, PersistedGrantStore>();
-
-            return identityServerBuilder;
-        }
-
         public static void AddCustomDataProtectionServices(
             this IServiceCollection services, IWebHostEnvironment env, GlobalSettings globalSettings)
         {
+            var builder = services.AddDataProtection().SetApplicationName("Bitwarden");
             if (env.IsDevelopment())
             {
                 return;
@@ -400,8 +370,7 @@ namespace Bit.Core.Utilities
 
             if (globalSettings.SelfHosted && CoreHelpers.SettingHasValue(globalSettings.DataProtection.Directory))
             {
-                services.AddDataProtection()
-                    .PersistKeysToFileSystem(new DirectoryInfo(globalSettings.DataProtection.Directory));
+                builder.PersistKeysToFileSystem(new DirectoryInfo(globalSettings.DataProtection.Directory));
             }
 
             if (!globalSettings.SelfHosted && CoreHelpers.SettingHasValue(globalSettings.Storage?.ConnectionString))
@@ -419,10 +388,29 @@ namespace Bit.Core.Utilities
                         "dataprotection.pfx", globalSettings.DataProtection.CertificatePassword)
                         .GetAwaiter().GetResult();
                 }
-                services.AddDataProtection()
+                builder
                     .PersistKeysToAzureBlobStorage(storageAccount, "aspnet-dataprotection/keys.xml")
                     .ProtectKeysWithCertificate(dataProtectionCert);
             }
+        }
+
+        public static IIdentityServerBuilder AddIdentityServerCertificate(
+            this IIdentityServerBuilder identityServerBuilder, IWebHostEnvironment env, GlobalSettings globalSettings)
+        {
+            var certificate = CoreHelpers.GetIdentityServerCertificate(globalSettings);
+            if (certificate != null)
+            {
+                identityServerBuilder.AddSigningCredential(certificate);
+            }
+            else if (env.IsDevelopment())
+            {
+                identityServerBuilder.AddDeveloperSigningCredential(false);
+            }
+            else
+            {
+                throw new Exception("No identity certificate to use.");
+            }
+            return identityServerBuilder;
         }
 
         public static GlobalSettings AddGlobalSettingsServices(this IServiceCollection services,
@@ -486,6 +474,33 @@ namespace Bit.Core.Utilities
                 options.ForwardLimit = null;
             }
             app.UseForwardedHeaders(options);
+        }
+
+        public static void AddCoreLocalizationServices(this IServiceCollection services)
+        {
+            services.AddTransient<II18nService, I18nService>();
+            services.AddLocalization(options => options.ResourcesPath = "Resources");
+        }
+
+        public static IApplicationBuilder UseCoreLocalization(this IApplicationBuilder app)
+        {
+            var supportedCultures = new[] { "en" };
+            return app.UseRequestLocalization(options => options
+                .SetDefaultCulture(supportedCultures[0])
+                .AddSupportedCultures(supportedCultures)
+                .AddSupportedUICultures(supportedCultures));
+        }
+
+        public static IMvcBuilder AddViewAndDataAnnotationLocalization(this IMvcBuilder mvc)
+        {
+            mvc.Services.AddTransient<IViewLocalizer, I18nViewLocalizer>();
+            return mvc.AddViewLocalization(options => options.ResourcesPath = "Resources")
+                .AddDataAnnotationsLocalization(options => 
+                    options.DataAnnotationLocalizerProvider = (type, factory) =>
+                    {
+                        var assemblyName = new AssemblyName(typeof(SharedResources).GetTypeInfo().Assembly.FullName);
+                        return factory.Create("SharedResources", assemblyName.Name);
+                    });
         }
     }
 }

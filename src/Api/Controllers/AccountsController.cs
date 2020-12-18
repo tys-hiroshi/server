@@ -1,20 +1,22 @@
-﻿using System;
-using System.Threading.Tasks;
+﻿using Bit.Api.Utilities;
+using Bit.Core;
+using Bit.Core.Enums;
+using Bit.Core.Exceptions;
+using Bit.Core.Models.Api;
+using Bit.Core.Models.Api.Request.Accounts;
+using Bit.Core.Models.Business;
+using Bit.Core.Models.Data;
+using Bit.Core.Models.Table;
+using Bit.Core.Repositories;
+using Bit.Core.Services;
+using Bit.Core.Utilities;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
-using Bit.Core.Models.Api;
-using Bit.Core.Exceptions;
-using Bit.Core.Services;
-using Bit.Core.Enums;
-using System.Linq;
-using Bit.Core.Repositories;
-using Bit.Core.Utilities;
-using Bit.Core;
-using Bit.Core.Models.Business;
-using Bit.Api.Utilities;
-using Bit.Core.Models.Table;
+using System;
 using System.Collections.Generic;
-using Bit.Core.Models.Data;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
 
 namespace Bit.Api.Controllers
 {
@@ -22,30 +24,34 @@ namespace Bit.Api.Controllers
     [Authorize("Application")]
     public class AccountsController : Controller
     {
-        private readonly IUserService _userService;
-        private readonly IUserRepository _userRepository;
+        private readonly GlobalSettings _globalSettings;
         private readonly ICipherRepository _cipherRepository;
         private readonly IFolderRepository _folderRepository;
+        private readonly IOrganizationService _organizationService;
         private readonly IOrganizationUserRepository _organizationUserRepository;
         private readonly IPaymentService _paymentService;
-        private readonly GlobalSettings _globalSettings;
+        private readonly IUserRepository _userRepository;
+        private readonly IUserService _userService;
 
         public AccountsController(
-            IUserService userService,
-            IUserRepository userRepository,
+            GlobalSettings globalSettings,
             ICipherRepository cipherRepository,
             IFolderRepository folderRepository,
+            IOrganizationService organizationService,
             IOrganizationUserRepository organizationUserRepository,
             IPaymentService paymentService,
-            GlobalSettings globalSettings)
+            ISsoUserRepository ssoUserRepository,
+            IUserRepository userRepository,
+            IUserService userService)
         {
-            _userService = userService;
-            _userRepository = userRepository;
             _cipherRepository = cipherRepository;
             _folderRepository = folderRepository;
+            _globalSettings = globalSettings;
+            _organizationService = organizationService;
             _organizationUserRepository = organizationUserRepository;
             _paymentService = paymentService;
-            _globalSettings = globalSettings;
+            _userRepository = userRepository;
+            _userService = userService;
         }
 
         [HttpPost("prelogin")]
@@ -191,6 +197,49 @@ namespace Bit.Api.Controllers
                 ModelState.AddModelError(string.Empty, error.Description);
             }
 
+            await Task.Delay(2000);
+            throw new BadRequestException(ModelState);
+        }
+
+        [HttpPost("set-password")]
+        public async Task PostSetPasswordAsync([FromBody]SetPasswordRequestModel model)
+        {
+            var user = await _userService.GetUserByPrincipalAsync(User);
+            if (user == null)
+            {
+                throw new UnauthorizedAccessException();
+            }
+
+            var result = await _userService.SetPasswordAsync(model.ToUser(user), model.MasterPasswordHash, model.Key, 
+                model.OrgIdentifier);
+            if (result.Succeeded)
+            {
+                return;
+            }
+
+            foreach (var error in result.Errors)
+            {
+                ModelState.AddModelError(string.Empty, error.Description);
+            }
+
+            throw new BadRequestException(ModelState);
+        }
+
+        [HttpPost("verify-password")]
+        public async Task PostVerifyPassword([FromBody]VerifyPasswordRequestModel model)
+        {
+            var user = await _userService.GetUserByPrincipalAsync(User);
+            if (user == null)
+            {
+                throw new UnauthorizedAccessException();
+            }
+
+            if (await _userService.CheckPasswordAsync(user, model.MasterPasswordHash))
+            {
+                return;
+            }
+
+            ModelState.AddModelError(nameof(model.MasterPasswordHash), "Invalid password.");
             await Task.Delay(2000);
             throw new BadRequestException(ModelState);
         }
@@ -468,13 +517,23 @@ namespace Bit.Api.Controllers
                 license = await ApiHelpers.ReadJsonFileFromBody<UserLicense>(HttpContext, model.License);
             }
 
+            if (!valid && !_globalSettings.SelfHosted && string.IsNullOrWhiteSpace(model.Country))
+            {
+                throw new BadRequestException("Country is required.");
+            }
+
             if (!valid || (_globalSettings.SelfHosted && license == null))
             {
                 throw new BadRequestException("Invalid license.");
             }
 
             var result = await _userService.SignUpPremiumAsync(user, model.PaymentToken,
-                model.PaymentMethodType.Value, model.AdditionalStorageGb.GetValueOrDefault(0), license);
+                model.PaymentMethodType.Value, model.AdditionalStorageGb.GetValueOrDefault(0), license,
+                new TaxInfo
+                {
+                    BillingAddressCountry = model.Country,
+                    BillingAddressPostalCode = model.PostalCode,
+                });
             var profile = new ProfileResponseModel(user, null, await _userService.TwoFactorIsEnabledAsync(user));
             return new PaymentResponseModel
             {
@@ -534,7 +593,12 @@ namespace Bit.Api.Controllers
                 throw new UnauthorizedAccessException();
             }
 
-            await _userService.ReplacePaymentMethodAsync(user, model.PaymentToken, model.PaymentMethodType.Value);
+            await _userService.ReplacePaymentMethodAsync(user, model.PaymentToken, model.PaymentMethodType.Value,
+                new TaxInfo
+                {
+                    BillingAddressCountry = model.Country,
+                    BillingAddressPostalCode = model.PostalCode,
+                });
         }
 
         [HttpPost("storage")]
@@ -598,6 +662,121 @@ namespace Bit.Api.Controllers
             }
 
             await _userService.ReinstatePremiumAsync(user);
+        }
+
+        [HttpGet("enterprise-portal-signin-token")]
+        [Authorize("Web")]
+        public async Task<string> GetEnterprisePortalSignInToken()
+        {
+            var user = await _userService.GetUserByPrincipalAsync(User);
+            if (user == null)
+            {
+                throw new UnauthorizedAccessException();
+            }
+
+            var token = await _userService.GenerateEnterprisePortalSignInTokenAsync(user);
+            if (token == null)
+            {
+                throw new BadRequestException("Cannot generate sign in token.");
+            }
+
+            return token;
+        }
+
+        [HttpGet("tax")]
+        [SelfHosted(NotSelfHostedOnly = true)]
+        public async Task<TaxInfoResponseModel> GetTaxInfo()
+        {
+            var user = await _userService.GetUserByPrincipalAsync(User);
+            if (user == null)
+            {
+                throw new UnauthorizedAccessException();
+            }
+
+            var taxInfo = await _paymentService.GetTaxInfoAsync(user);
+            return new TaxInfoResponseModel(taxInfo);
+        }
+
+        [HttpPut("tax")]
+        [SelfHosted(NotSelfHostedOnly = true)]
+        public async Task PutTaxInfo([FromBody]TaxInfoUpdateRequestModel model)
+        {
+            var user = await _userService.GetUserByPrincipalAsync(User);
+            if (user == null)
+            {
+                throw new UnauthorizedAccessException();
+            }
+
+            var taxInfo = new TaxInfo
+            {
+                BillingAddressPostalCode = model.PostalCode,
+                BillingAddressCountry = model.Country,
+            };
+            await _paymentService.SaveTaxInfoAsync(user, taxInfo);
+        }
+
+        [HttpDelete("sso/{organizationId}")]
+        public async Task DeleteSsoUser(string organizationId)
+        {
+            var userId = _userService.GetProperUserId(User);
+            if (!userId.HasValue)
+            {
+                throw new NotFoundException();
+            }
+
+            await _organizationService.DeleteSsoUserAsync(userId.Value, new Guid(organizationId));
+        }
+
+        [HttpGet("sso/user-identifier")]
+        public async Task<string> GetSsoUserIdentifier()
+        {
+            var user = await _userService.GetUserByPrincipalAsync(User);
+            var token = await _userService.GenerateSignInTokenAsync(user, TokenPurposes.LinkSso);
+            var userIdentifier = $"{user.Id},{token}";
+            return userIdentifier;
+        }
+
+        [HttpPost("api-key")]
+        public async Task<ApiKeyResponseModel> ApiKey([FromBody]ApiKeyRequestModel model)
+        {
+            var user = await _userService.GetUserByPrincipalAsync(User);
+            if (user == null)
+            {
+                throw new UnauthorizedAccessException();
+            }
+
+            if (!await _userService.CheckPasswordAsync(user, model.MasterPasswordHash))
+            {
+                await Task.Delay(2000);
+                throw new BadRequestException("MasterPasswordHash", "Invalid password.");
+            }
+            else
+            {
+                var response = new ApiKeyResponseModel(user);
+                return response;
+            }
+        }
+
+        [HttpPost("rotate-api-key")]
+        public async Task<ApiKeyResponseModel> RotateApiKey([FromBody]ApiKeyRequestModel model)
+        {
+            var user = await _userService.GetUserByPrincipalAsync(User);
+            if (user == null)
+            {
+                throw new UnauthorizedAccessException();
+            }
+
+            if (!await _userService.CheckPasswordAsync(user, model.MasterPasswordHash))
+            {
+                await Task.Delay(2000);
+                throw new BadRequestException("MasterPasswordHash", "Invalid password.");
+            }
+            else
+            {
+                await _userService.RotateApiKeyAsync(user);
+                var response = new ApiKeyResponseModel(user);
+                return response;
+            }
         }
     }
 }

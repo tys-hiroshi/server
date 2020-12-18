@@ -7,11 +7,12 @@ using System.Linq;
 
 namespace Bit.Core.Models.Table
 {
-    public class Organization : ITableObject<Guid>, ISubscriber, IStorable, IStorableSubscriber, IRevisable
+    public class Organization : ITableObject<Guid>, ISubscriber, IStorable, IStorableSubscriber, IRevisable, IReferenceable
     {
         private Dictionary<TwoFactorProviderType, TwoFactorProvider> _twoFactorProviders;
 
         public Guid Id { get; set; }
+        public string Identifier { get; set; }
         public string Name { get; set; }
         public string BusinessName { get; set; }
         public string BusinessAddress1 { get; set; }
@@ -25,6 +26,7 @@ namespace Bit.Core.Models.Table
         public short? Seats { get; set; }
         public short? MaxCollections { get; set; }
         public bool UsePolicies { get; set; }
+        public bool UseSso { get; set; }
         public bool UseGroups { get; set; }
         public bool UseDirectory { get; set; }
         public bool UseEvents { get; set; }
@@ -38,6 +40,7 @@ namespace Bit.Core.Models.Table
         public GatewayType? Gateway { get; set; }
         public string GatewayCustomerId { get; set; }
         public string GatewaySubscriptionId { get; set; }
+        public string ReferenceData { get; set; }
         public bool Enabled { get; set; } = true;
         public string LicenseKey { get; set; }
         public string ApiKey { get; set; }

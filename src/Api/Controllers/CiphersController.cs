@@ -113,7 +113,7 @@ namespace Bit.Api.Controllers
                 throw new NotFoundException();
             }
 
-            await _cipherService.SaveDetailsAsync(cipher, userId, null, cipher.OrganizationId.HasValue);
+            await _cipherService.SaveDetailsAsync(cipher, userId, model.LastKnownRevisionDate, null, cipher.OrganizationId.HasValue);
             var response = new CipherResponseModel(cipher, _globalSettings);
             return response;
         }
@@ -128,7 +128,7 @@ namespace Bit.Api.Controllers
                 throw new NotFoundException();
             }
 
-            await _cipherService.SaveDetailsAsync(cipher, userId, model.CollectionIds, cipher.OrganizationId.HasValue);
+            await _cipherService.SaveDetailsAsync(cipher, userId, model.Cipher.LastKnownRevisionDate, model.CollectionIds, cipher.OrganizationId.HasValue);
             var response = new CipherResponseModel(cipher, _globalSettings);
             return response;
         }
@@ -143,7 +143,7 @@ namespace Bit.Api.Controllers
             }
 
             var userId = _userService.GetProperUserId(User).Value;
-            await _cipherService.SaveAsync(cipher, userId, model.CollectionIds, true, false);
+            await _cipherService.SaveAsync(cipher, userId, model.Cipher.LastKnownRevisionDate, model.CollectionIds, true, false);
 
             var response = new CipherMiniResponseModel(cipher, _globalSettings, false);
             return response;
@@ -168,7 +168,7 @@ namespace Bit.Api.Controllers
                     "then try again.");
             }
 
-            await _cipherService.SaveDetailsAsync(model.ToCipherDetails(cipher), userId);
+            await _cipherService.SaveDetailsAsync(model.ToCipherDetails(cipher), userId, model.LastKnownRevisionDate);
 
             var response = new CipherResponseModel(cipher, _globalSettings);
             return response;
@@ -187,8 +187,8 @@ namespace Bit.Api.Controllers
             }
 
             // object cannot be a descendant of CipherDetails, so let's clone it.
-            var cipherClone = CoreHelpers.CloneObject(model.ToCipher(cipher));
-            await _cipherService.SaveAsync(cipherClone, userId, null, true, false);
+            var cipherClone = model.ToCipher(cipher).Clone();
+            await _cipherService.SaveAsync(cipherClone, userId, model.LastKnownRevisionDate, null, true, false);
 
             var response = new CipherMiniResponseModel(cipherClone, _globalSettings, cipher.OrganizationUseTotp);
             return response;
@@ -276,9 +276,9 @@ namespace Bit.Api.Controllers
                 throw new NotFoundException();
             }
 
-            var original = CoreHelpers.CloneObject(cipher);
-            await _cipherService.ShareAsync(original, model.Cipher.ToCipher(cipher), 
-                new Guid(model.Cipher.OrganizationId), model.CollectionIds.Select(c => new Guid(c)), userId);
+            var original = cipher.Clone();
+            await _cipherService.ShareAsync(original, model.Cipher.ToCipher(cipher), new Guid(model.Cipher.OrganizationId),
+                model.CollectionIds.Select(c => new Guid(c)), userId, model.Cipher.LastKnownRevisionDate);
 
             var sharedCipher = await _cipherRepository.GetByIdAsync(cipherId, userId);
             var response = new CipherResponseModel(sharedCipher, _globalSettings);
@@ -360,6 +360,26 @@ namespace Bit.Api.Controllers
             await _cipherService.DeleteManyAsync(model.Ids.Select(i => new Guid(i)), userId);
         }
 
+        [HttpDelete("admin")]
+        [HttpPost("delete-admin")]
+        public async Task DeleteManyAdmin([FromBody]CipherBulkDeleteRequestModel model)
+        {
+            if (!_globalSettings.SelfHosted && model.Ids.Count() > 500)
+            {
+                throw new BadRequestException("You can only delete up to 500 items at a time. " +
+                    "Consider using the \"Purge Vault\" option instead.");
+            }
+
+            if (model == null || string.IsNullOrWhiteSpace(model.OrganizationId) ||
+                !_currentContext.OrganizationAdmin(new Guid(model.OrganizationId)))
+            {
+                throw new NotFoundException();
+            }
+
+            var userId = _userService.GetProperUserId(User).Value;
+            await _cipherService.DeleteManyAsync(model.Ids.Select(i => new Guid(i)), userId, new Guid(model.OrganizationId), true);
+        }
+
         [HttpPut("{id}/delete")]
         public async Task PutDelete(string id)
         {
@@ -387,15 +407,33 @@ namespace Bit.Api.Controllers
         }
 
         [HttpPut("delete")]
-        public async Task PutDeleteMany([FromBody]CipherBulkRestoreRequestModel model)
+        public async Task PutDeleteMany([FromBody]CipherBulkDeleteRequestModel model)
         {
             if (!_globalSettings.SelfHosted && model.Ids.Count() > 500)
             {
-                throw new BadRequestException("You can only restore up to 500 items at a time.");
+                throw new BadRequestException("You can only delete up to 500 items at a time.");
             }
 
             var userId = _userService.GetProperUserId(User).Value;
             await _cipherService.SoftDeleteManyAsync(model.Ids.Select(i => new Guid(i)), userId);
+        }
+
+        [HttpPut("delete-admin")]
+        public async Task PutDeleteManyAdmin([FromBody]CipherBulkDeleteRequestModel model)
+        {
+            if (!_globalSettings.SelfHosted && model.Ids.Count() > 500)
+            {
+                throw new BadRequestException("You can only delete up to 500 items at a time.");
+            }
+
+            if (model == null || string.IsNullOrWhiteSpace(model.OrganizationId) ||
+                !_currentContext.OrganizationAdmin(new Guid(model.OrganizationId)))
+            {
+                throw new NotFoundException();
+            }
+
+            var userId = _userService.GetProperUserId(User).Value;
+            await _cipherService.SoftDeleteManyAsync(model.Ids.Select(i => new Guid(i)), userId, new Guid(model.OrganizationId), true);
         }
 
         [HttpPut("{id}/restore")]
@@ -465,7 +503,7 @@ namespace Bit.Api.Controllers
             var ciphers = await _cipherRepository.GetManyByUserIdAsync(userId, false);
             var ciphersDict = ciphers.ToDictionary(c => c.Id);
 
-            var shareCiphers = new List<Cipher>();
+            var shareCiphers = new List<(Cipher, DateTime?)>();
             foreach (var cipher in model.Ciphers)
             {
                 if (!ciphersDict.ContainsKey(cipher.Id.Value))
@@ -473,7 +511,7 @@ namespace Bit.Api.Controllers
                     throw new BadRequestException("Trying to share ciphers that you do not own.");
                 }
 
-                shareCiphers.Add(cipher.ToCipher(ciphersDict[cipher.Id.Value]));
+                shareCiphers.Add((cipher.ToCipher(ciphersDict[cipher.Id.Value]), cipher.LastKnownRevisionDate));
             }
 
             await _cipherService.ShareManyAsync(shareCiphers, organizationId,

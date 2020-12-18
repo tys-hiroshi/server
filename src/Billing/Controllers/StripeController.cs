@@ -1,5 +1,6 @@
 ﻿using Bit.Core;
 using Bit.Core.Enums;
+using Bit.Core.Models.Business;
 using Bit.Core.Models.Table;
 using Bit.Core.Repositories;
 using Bit.Core.Services;
@@ -34,6 +35,8 @@ namespace Bit.Billing.Controllers
         private readonly IMailService _mailService;
         private readonly ILogger<StripeController> _logger;
         private readonly Braintree.BraintreeGateway _btGateway;
+        private readonly IReferenceEventService _referenceEventService;
+        private readonly ITaxRateRepository _taxRateRepository;
 
         public StripeController(
             GlobalSettings globalSettings,
@@ -45,7 +48,9 @@ namespace Bit.Billing.Controllers
             IUserService userService,
             IAppleIapService appleIapService,
             IMailService mailService,
-            ILogger<StripeController> logger)
+            IReferenceEventService referenceEventService,
+            ILogger<StripeController> logger,
+            ITaxRateRepository taxRateRepository)
         {
             _billingSettings = billingSettings?.Value;
             _hostingEnvironment = hostingEnvironment;
@@ -55,6 +60,8 @@ namespace Bit.Billing.Controllers
             _userService = userService;
             _appleIapService = appleIapService;
             _mailService = mailService;
+            _referenceEventService = referenceEventService;
+            _taxRateRepository = taxRateRepository;
             _logger = logger;
             _btGateway = new Braintree.BraintreeGateway
             {
@@ -146,6 +153,8 @@ namespace Bit.Billing.Controllers
                     throw new Exception("Invoice subscription is null. " + invoice.Id);
                 }
 
+                subscription = await VerifyCorrectTaxRateForCharge(invoice, subscription);
+
                 string email = null;
                 var ids = GetIdsFromMetaData(subscription.Metadata);
                 // org
@@ -204,7 +213,7 @@ namespace Bit.Billing.Controllers
                 {
                     var subscriptions = await subscriptionService.ListAsync(new SubscriptionListOptions
                     {
-                        CustomerId = charge.CustomerId
+                        Customer = charge.CustomerId
                     });
                     foreach (var sub in subscriptions)
                     {
@@ -381,6 +390,17 @@ namespace Bit.Billing.Controllers
                             {
                                 await _userService.EnablePremiumAsync(ids.Item2.Value, subscription.CurrentPeriodEnd);
                             }
+                        }
+                        if (ids.Item1.HasValue || ids.Item2.HasValue)
+                        {
+                            await _referenceEventService.RaiseEventAsync(
+                                new ReferenceEvent(ReferenceEventType.Rebilled, null)
+                                {
+                                    Id = ids.Item1 ?? ids.Item2 ?? default,
+                                    Source = ids.Item1.HasValue
+                                        ? ReferenceEventSource.Organization
+                                        : ReferenceEventSource.User,
+                                });
                         }
                     }
                 }
@@ -723,6 +743,32 @@ namespace Bit.Billing.Controllers
             if (subscription == null)
             {
                 throw new Exception("Subscription is null. " + eventSubscription.Id);
+            }
+            return subscription;
+        }
+
+        private async Task<Subscription> VerifyCorrectTaxRateForCharge(Invoice invoice, Subscription subscription)
+        {
+            if (!string.IsNullOrWhiteSpace(invoice?.CustomerAddress?.Country) && !string.IsNullOrWhiteSpace(invoice?.CustomerAddress?.PostalCode))
+            {
+                var localBitwardenTaxRates = await _taxRateRepository.GetByLocationAsync(
+                    new Bit.Core.Models.Table.TaxRate() 
+                    { 
+                        Country = invoice.CustomerAddress.Country,
+                        PostalCode = invoice.CustomerAddress.PostalCode 
+                    }
+                );
+
+                if (localBitwardenTaxRates.Any())
+                {
+                    var stripeTaxRate = await new TaxRateService().GetAsync(localBitwardenTaxRates.First().Id);
+                    if (stripeTaxRate != null && !subscription.DefaultTaxRates.Any(x => x == stripeTaxRate))
+                    {
+                        subscription.DefaultTaxRates = new List<Stripe.TaxRate> { stripeTaxRate };
+                        var subscriptionOptions = new SubscriptionUpdateOptions() { DefaultTaxRates = new List<string>() { stripeTaxRate.Id } };
+                        subscription = await new SubscriptionService().UpdateAsync(subscription.Id, subscriptionOptions);
+                    }
+                }
             }
             return subscription;
         }

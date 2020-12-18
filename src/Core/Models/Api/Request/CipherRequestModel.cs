@@ -38,6 +38,7 @@ namespace Bit.Core.Models.Api
         public CipherCardModel Card { get; set; }
         public CipherIdentityModel Identity { get; set; }
         public CipherSecureNoteModel SecureNote { get; set; }
+        public DateTime? LastKnownRevisionDate { get; set; } = null;
 
         public CipherDetails ToCipherDetails(Guid userId, bool allowOrgIdSet = true)
         {
@@ -47,7 +48,8 @@ namespace Bit.Core.Models.Api
                 Type = Type,
                 UserId = !hasOrgId ? (Guid?)userId : null,
                 OrganizationId = allowOrgIdSet && hasOrgId ? new Guid(OrganizationId) : (Guid?)null,
-                Edit = true
+                Edit = true,
+                ViewPassword = true,
             };
             ToCipherDetails(cipher);
             return cipher;
@@ -203,6 +205,7 @@ namespace Bit.Core.Models.Api
     {
         [Required]
         public IEnumerable<string> Ids { get; set; }
+        public string OrganizationId { get; set; }
     }
 
     public class CipherBulkRestoreRequestModel

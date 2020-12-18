@@ -45,8 +45,10 @@ namespace Bit.Core.Services
         private readonly IPaymentService _paymentService;
         private readonly IPolicyRepository _policyRepository;
         private readonly IDataProtector _organizationServiceDataProtector;
+        private readonly IReferenceEventService _referenceEventService;
         private readonly CurrentContext _currentContext;
         private readonly GlobalSettings _globalSettings;
+        private readonly IOrganizationService _organizationService;
 
         public UserService(
             IUserRepository userRepository,
@@ -71,8 +73,10 @@ namespace Bit.Core.Services
             IDataProtectionProvider dataProtectionProvider,
             IPaymentService paymentService,
             IPolicyRepository policyRepository,
+            IReferenceEventService referenceEventService,
             CurrentContext currentContext,
-            GlobalSettings globalSettings)
+            GlobalSettings globalSettings,
+            IOrganizationService organizationService)
             : base(
                   store,
                   optionsAccessor,
@@ -102,8 +106,10 @@ namespace Bit.Core.Services
             _policyRepository = policyRepository;
             _organizationServiceDataProtector = dataProtectionProvider.CreateProtector(
                 "OrganizationServiceDataProtector");
+            _referenceEventService = referenceEventService;
             _currentContext = currentContext;
             _globalSettings = globalSettings;
+            _organizationService = organizationService;
         }
 
         public Guid? GetProperUserId(ClaimsPrincipal principal)
@@ -219,6 +225,8 @@ namespace Bit.Core.Services
             }
 
             await _userRepository.DeleteAsync(user);
+            await _referenceEventService.RaiseEventAsync(
+                new ReferenceEvent(ReferenceEventType.DeleteAccount, user));
             await _pushService.PushLogOutAsync(user.Id);
             return IdentityResult.Success;
         }
@@ -284,10 +292,24 @@ namespace Bit.Core.Services
                 }
             }
 
+            user.ApiKey = CoreHelpers.SecureRandomString(30);
             var result = await base.CreateAsync(user, masterPassword);
             if (result == IdentityResult.Success)
             {
                 await _mailService.SendWelcomeEmailAsync(user);
+                await _referenceEventService.RaiseEventAsync(new ReferenceEvent(ReferenceEventType.Signup, user));
+            }
+
+            return result;
+        }
+
+        public async Task<IdentityResult> RegisterUserAsync(User user)
+        {
+            var result = await base.CreateAsync(user);
+            if (result == IdentityResult.Success)
+            {
+                await _mailService.SendWelcomeEmailAsync(user);
+                await _referenceEventService.RaiseEventAsync(new ReferenceEvent(ReferenceEventType.Signup, user));
             }
 
             return result;
@@ -561,6 +583,40 @@ namespace Bit.Core.Services
             return IdentityResult.Failed(_identityErrorDescriber.PasswordMismatch());
         }
 
+        public async Task<IdentityResult> SetPasswordAsync(User user, string masterPassword, string key, 
+            string orgIdentifier = null)
+        {
+            if (user == null)
+            {
+                throw new ArgumentNullException(nameof(user));
+            }
+
+            if (!string.IsNullOrWhiteSpace(user.MasterPassword))
+            {
+                Logger.LogWarning("Change password failed for user {userId} - already has password.", user.Id);
+                return IdentityResult.Failed(_identityErrorDescriber.UserAlreadyHasPassword());
+            }
+
+            var result = await UpdatePasswordHash(user, masterPassword, true, false);
+            if (!result.Succeeded)
+            {
+                return result;
+            }
+
+            user.RevisionDate = user.AccountRevisionDate = DateTime.UtcNow;
+            user.Key = key;
+
+            await _userRepository.ReplaceAsync(user);
+            await _eventService.LogUserEventAsync(user.Id, EventType.User_ChangedPassword);
+            
+            if (!string.IsNullOrWhiteSpace(orgIdentifier))
+            {
+                await _organizationService.AcceptUserAsync(orgIdentifier, user, this);
+            }
+            
+            return IdentityResult.Success;
+        }
+
         public async Task<IdentityResult> ChangeKdfAsync(User user, string masterPassword, string newMasterPassword,
             string key, KdfType kdf, int kdfIterations)
         {
@@ -703,7 +759,8 @@ namespace Bit.Core.Services
         }
 
         public async Task<Tuple<bool, string>> SignUpPremiumAsync(User user, string paymentToken,
-            PaymentMethodType paymentMethodType, short additionalStorageGb, UserLicense license)
+            PaymentMethodType paymentMethodType, short additionalStorageGb, UserLicense license,
+            TaxInfo taxInfo)
         {
             if (user.Premium)
             {
@@ -742,7 +799,7 @@ namespace Bit.Core.Services
             else
             {
                 paymentIntentClientSecret = await _paymentService.PurchasePremiumAsync(user, paymentMethodType,
-                    paymentToken, additionalStorageGb);
+                    paymentToken, additionalStorageGb, taxInfo);
             }
 
             user.Premium = true;
@@ -764,8 +821,14 @@ namespace Bit.Core.Services
             {
                 await SaveUserAsync(user);
                 await _pushService.PushSyncVaultAsync(user.Id);
+                await _referenceEventService.RaiseEventAsync(
+                    new ReferenceEvent(ReferenceEventType.UpgradePlan, user)
+                    {
+                        Storage = user.MaxStorageGb,
+                        PlanName = PremiumPlanId,
+                    });
             }
-            catch when(!_globalSettings.SelfHosted)
+            catch when (!_globalSettings.SelfHosted)
             {
                 await paymentService.CancelAndRecoverChargesAsync(user);
                 throw;
@@ -840,18 +903,24 @@ namespace Bit.Core.Services
 
             var secret = await BillingHelpers.AdjustStorageAsync(_paymentService, user, storageAdjustmentGb,
                 StoragePlanId);
+            await _referenceEventService.RaiseEventAsync(
+                new ReferenceEvent(ReferenceEventType.AdjustStorage, user)
+                {
+                    Storage = storageAdjustmentGb,
+                    PlanName = StoragePlanId,
+                });
             await SaveUserAsync(user);
             return secret;
         }
 
-        public async Task ReplacePaymentMethodAsync(User user, string paymentToken, PaymentMethodType paymentMethodType)
+        public async Task ReplacePaymentMethodAsync(User user, string paymentToken, PaymentMethodType paymentMethodType, TaxInfo taxInfo)
         {
             if (paymentToken.StartsWith("btok_"))
             {
                 throw new BadRequestException("Invalid token.");
             }
 
-            var updated = await _paymentService.UpdatePaymentMethodAsync(user, paymentMethodType, paymentToken);
+            var updated = await _paymentService.UpdatePaymentMethodAsync(user, paymentMethodType, paymentToken, taxInfo: taxInfo);
             if (updated)
             {
                 await SaveUserAsync(user);
@@ -867,11 +936,18 @@ namespace Bit.Core.Services
                 eop = false;
             }
             await _paymentService.CancelSubscriptionAsync(user, eop, accountDelete);
+            await _referenceEventService.RaiseEventAsync(
+                new ReferenceEvent(ReferenceEventType.CancelSubscription, user)
+                {
+                    EndOfPeriod = eop,
+                });
         }
 
         public async Task ReinstatePremiumAsync(User user)
         {
             await _paymentService.ReinstateSubscriptionAsync(user);
+            await _referenceEventService.RaiseEventAsync(
+                new ReferenceEvent(ReferenceEventType.ReinstateSubscription, user));
         }
 
         public async Task EnablePremiumAsync(Guid userId, DateTime? expirationDate)
@@ -919,7 +995,8 @@ namespace Bit.Core.Services
             }
         }
 
-        public async Task<UserLicense> GenerateLicenseAsync(User user, SubscriptionInfo subscriptionInfo = null)
+        public async Task<UserLicense> GenerateLicenseAsync(User user, SubscriptionInfo subscriptionInfo = null,
+            int? version = null)
         {
             if (user == null)
             {
@@ -1020,6 +1097,22 @@ namespace Bit.Core.Services
             return await CanAccessPremium(user);
         }
 
+        //TODO refactor this to use the below method and enum
+        public async Task<string> GenerateEnterprisePortalSignInTokenAsync(User user)
+        {
+            var token = await GenerateUserTokenAsync(user, Options.Tokens.PasswordResetTokenProvider,
+                "EnterprisePortalTokenSignIn");
+            return token;
+        }
+
+
+        public async Task<string> GenerateSignInTokenAsync(User user, string purpose)
+        {
+            var token = await GenerateUserTokenAsync(user, Options.Tokens.PasswordResetTokenProvider,
+                purpose);
+            return token;
+        }
+        
         private async Task<IdentityResult> UpdatePasswordHash(User user, string newPassword,
             bool validatePassword = true, bool refreshStamp = true)
         {
@@ -1100,6 +1193,24 @@ namespace Bit.Core.Services
                     }
                 }
             }
+        }
+
+        public override async Task<IdentityResult> ConfirmEmailAsync(User user, string token)
+        {
+            var result = await base.ConfirmEmailAsync(user, token);
+            if (result.Succeeded)
+            {
+                await _referenceEventService.RaiseEventAsync(
+                    new ReferenceEvent(ReferenceEventType.ConfirmEmailAddress, user));
+            }
+            return result;
+        }
+
+        public async Task RotateApiKeyAsync(User user)
+        {
+            user.ApiKey = CoreHelpers.SecureRandomString(30);
+            user.RevisionDate = DateTime.UtcNow;
+            await _userRepository.ReplaceAsync(user);
         }
     }
 }

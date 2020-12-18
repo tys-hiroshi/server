@@ -3,13 +3,11 @@ using Bit.Core.Enums;
 using Bit.Core.Utilities;
 using System.Collections.Generic;
 using Newtonsoft.Json;
-using Bit.Core.Services;
-using Bit.Core.Exceptions;
 using Microsoft.AspNetCore.Identity;
 
 namespace Bit.Core.Models.Table
 {
-    public class User : ITableObject<Guid>, ISubscriber, IStorable, IStorableSubscriber, IRevisable, ITwoFactorProvidersUser
+    public class User : ITableObject<Guid>, ISubscriber, IStorable, IStorableSubscriber, IRevisable, ITwoFactorProvidersUser, IReferenceable
     {
         private Dictionary<TwoFactorProviderType, TwoFactorProvider> _twoFactorProviders;
 
@@ -37,7 +35,9 @@ namespace Bit.Core.Models.Table
         public GatewayType? Gateway { get; set; }
         public string GatewayCustomerId { get; set; }
         public string GatewaySubscriptionId { get; set; }
+        public string ReferenceData { get; set; }
         public string LicenseKey { get; set; }
+        public string ApiKey { get; set; }
         public KdfType Kdf { get; set; } = KdfType.PBKDF2_SHA256;
         public int KdfIterations { get; set; } = 5000;
         public DateTime CreationDate { get; internal set; } = DateTime.UtcNow;

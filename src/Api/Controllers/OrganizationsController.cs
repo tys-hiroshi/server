@@ -4,6 +4,7 @@ using System.Threading.Tasks;
 using Microsoft.AspNetCore.Mvc;
 using Bit.Core.Repositories;
 using Microsoft.AspNetCore.Authorization;
+using Bit.Core.Enums;
 using Bit.Core.Models.Api;
 using Bit.Core.Exceptions;
 using Bit.Core.Services;
@@ -25,6 +26,7 @@ namespace Bit.Api.Controllers
         private readonly IPaymentService _paymentService;
         private readonly CurrentContext _currentContext;
         private readonly GlobalSettings _globalSettings;
+        private readonly IPolicyRepository _policyRepository;
 
         public OrganizationsController(
             IOrganizationRepository organizationRepository,
@@ -33,7 +35,8 @@ namespace Bit.Api.Controllers
             IUserService userService,
             IPaymentService paymentService,
             CurrentContext currentContext,
-            GlobalSettings globalSettings)
+            GlobalSettings globalSettings,
+            IPolicyRepository policyRepository)
         {
             _organizationRepository = organizationRepository;
             _organizationUserRepository = organizationUserRepository;
@@ -42,6 +45,7 @@ namespace Bit.Api.Controllers
             _paymentService = paymentService;
             _currentContext = currentContext;
             _globalSettings = globalSettings;
+            _policyRepository = policyRepository;
         }
 
         [HttpGet("{id}")]
@@ -132,12 +136,13 @@ namespace Bit.Api.Controllers
         }
 
         [HttpGet("")]
-        public async Task<ListResponseModel<OrganizationResponseModel>> GetUser()
+        public async Task<ListResponseModel<ProfileOrganizationResponseModel>> GetUser()
         {
             var userId = _userService.GetProperUserId(User).Value;
-            var organizations = await _organizationRepository.GetManyByUserIdAsync(userId);
-            var responses = organizations.Select(o => new OrganizationResponseModel(o));
-            return new ListResponseModel<OrganizationResponseModel>(responses);
+            var organizations = await _organizationUserRepository.GetManyDetailsByUserAsync(userId,
+                OrganizationUserStatusType.Confirmed);
+            var responses = organizations.Select(o => new ProfileOrganizationResponseModel(o));
+            return new ListResponseModel<ProfileOrganizationResponseModel>(responses);
         }
 
         [HttpPost("")]
@@ -148,6 +153,19 @@ namespace Bit.Api.Controllers
             if (user == null)
             {
                 throw new UnauthorizedAccessException();
+            }
+
+            var plan = StaticStore.Plans.FirstOrDefault(plan => plan.Type == model.PlanType);
+            if (plan == null || plan.LegacyYear != null)
+            {
+                throw new Exception("Invalid plan selected.");
+            }
+
+            var policies = await _policyRepository.GetManyByUserIdAsync(user.Id);
+            if (policies.Any(policy => policy.Type == PolicyType.SingleOrg))
+            {
+                throw new Exception("You may not create an organization. You belong to an organization " +
+                     "which has a policy that prohibits you from being a member of any other organization.");
             }
 
             var organizationSignup = model.ToOrganizationSignup(user);
@@ -171,13 +189,19 @@ namespace Bit.Api.Controllers
                 throw new BadRequestException("Invalid license");
             }
 
+            var policies = await _policyRepository.GetManyByUserIdAsync(user.Id);
+            if (policies.Any(policy => policy.Type == PolicyType.SingleOrg))
+            {
+                throw new Exception("You may not create an organization. You belong to an organization " +
+                     "which has a policy that prohibits you from being a member of any other organization.");
+            }
+
             var result = await _organizationService.SignUpAsync(license, user, model.Key, model.CollectionName);
             return new OrganizationResponseModel(result.Item1);
         }
 
         [HttpPut("{id}")]
         [HttpPost("{id}")]
-        [SelfHosted(NotSelfHostedOnly = true)]
         public async Task<OrganizationResponseModel> Put(string id, [FromBody]OrganizationUpdateRequestModel model)
         {
             var orgIdGuid = new Guid(id);
@@ -192,10 +216,10 @@ namespace Bit.Api.Controllers
                 throw new NotFoundException();
             }
 
-            var updatebilling = model.BusinessName != organization.BusinessName ||
-                model.BillingEmail != organization.BillingEmail;
+            var updatebilling = !_globalSettings.SelfHosted && (model.BusinessName != organization.BusinessName ||
+                model.BillingEmail != organization.BillingEmail);
 
-            await _organizationService.UpdateAsync(model.ToOrganization(organization), updatebilling);
+            await _organizationService.UpdateAsync(model.ToOrganization(organization, _globalSettings), updatebilling);
             return new OrganizationResponseModel(organization);
         }
 
@@ -210,7 +234,16 @@ namespace Bit.Api.Controllers
             }
 
             await _organizationService.ReplacePaymentMethodAsync(orgIdGuid, model.PaymentToken,
-                model.PaymentMethodType.Value);
+                model.PaymentMethodType.Value, new TaxInfo
+                {
+                    BillingAddressLine1 = model.Line1,
+                    BillingAddressLine2 = model.Line2,
+                    BillingAddressState = model.State,
+                    BillingAddressCity = model.City,
+                    BillingAddressPostalCode = model.PostalCode,
+                    BillingAddressCountry = model.Country,
+                    TaxIdNumber = model.TaxId,
+                });
         }
 
         [HttpPost("{id}/upgrade")]
@@ -375,7 +408,7 @@ namespace Bit.Api.Controllers
         public async Task Import(string id, [FromBody]ImportOrganizationUsersRequestModel model)
         {
             if (!_globalSettings.SelfHosted &&
-                (model.Groups.Count() > 200 || model.Users.Count(u => !u.Deleted) > 1000))
+                (model.Groups.Count() > 2000 || model.Users.Count(u => !u.Deleted) > 2000))
             {
                 throw new BadRequestException("You cannot import this much data at once.");
             }
@@ -461,6 +494,55 @@ namespace Bit.Api.Controllers
                 var response = new ApiKeyResponseModel(organization);
                 return response;
             }
+        }
+
+        [HttpGet("{id}/tax")]
+        [SelfHosted(NotSelfHostedOnly = true)]
+        public async Task<TaxInfoResponseModel> GetTaxInfo(string id)
+        {
+            var orgIdGuid = new Guid(id);
+            if (!_currentContext.OrganizationOwner(orgIdGuid))
+            {
+                throw new NotFoundException();
+            }
+
+            var organization = await _organizationRepository.GetByIdAsync(orgIdGuid);
+            if (organization == null)
+            {
+                throw new NotFoundException();
+            }
+
+            var taxInfo = await _paymentService.GetTaxInfoAsync(organization);
+            return new TaxInfoResponseModel(taxInfo);
+        }
+
+        [HttpPut("{id}/tax")]
+        [SelfHosted(NotSelfHostedOnly = true)]
+        public async Task PutTaxInfo(string id, [FromBody]OrganizationTaxInfoUpdateRequestModel model)
+        {
+            var orgIdGuid = new Guid(id);
+            if (!_currentContext.OrganizationOwner(orgIdGuid))
+            {
+                throw new NotFoundException();
+            }
+
+            var organization = await _organizationRepository.GetByIdAsync(orgIdGuid);
+            if (organization == null)
+            {
+                throw new NotFoundException();
+            }
+
+            var taxInfo = new TaxInfo
+            {
+                TaxIdNumber = model.TaxId,
+                BillingAddressLine1 = model.Line1,
+                BillingAddressLine2 = model.Line2,
+                BillingAddressCity = model.City,
+                BillingAddressState = model.State,
+                BillingAddressPostalCode = model.PostalCode,
+                BillingAddressCountry = model.Country,
+            };
+            await _paymentService.SaveTaxInfoAsync(organization, taxInfo);
         }
     }
 }

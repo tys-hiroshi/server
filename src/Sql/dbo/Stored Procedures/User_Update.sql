@@ -23,11 +23,13 @@
     @Gateway TINYINT,
     @GatewayCustomerId VARCHAR(50),
     @GatewaySubscriptionId VARCHAR(50),
+    @ReferenceData VARCHAR(MAX),
     @LicenseKey VARCHAR(100),
     @Kdf TINYINT,
     @KdfIterations INT,
     @CreationDate DATETIME2(7),
-    @RevisionDate DATETIME2(7)
+    @RevisionDate DATETIME2(7),
+    @ApiKey VARCHAR(30)
 AS
 BEGIN
     SET NOCOUNT ON
@@ -58,11 +60,13 @@ BEGIN
         [Gateway] = @Gateway,
         [GatewayCustomerId] = @GatewayCustomerId,
         [GatewaySubscriptionId] = @GatewaySubscriptionId,
+        [ReferenceData] = @ReferenceData,
         [LicenseKey] = @LicenseKey,
         [Kdf] = @Kdf,
         [KdfIterations] = @KdfIterations,
         [CreationDate] = @CreationDate,
-        [RevisionDate] = @RevisionDate
+        [RevisionDate] = @RevisionDate,
+        [ApiKey] = @ApiKey
     WHERE
         [Id] = @Id
 END
